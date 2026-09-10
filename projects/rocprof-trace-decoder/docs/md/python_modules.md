@@ -30,6 +30,7 @@ ROCm-prefix path being present on `sys.path`.
 | `rocprof_trace_decoder.bindings` | `ctypes` wrapper around `librocprof-trace-decoder` | Public for `Decoder`, internal for C mirrors |
 | `rocprof_trace_decoder.code_index` | ISA lookup and instruction-stat accumulation | Public utility |
 | `rocprof_trace_decoder.codegen` | Builds in-memory code metadata from explicit code object inputs | Public utility |
+| `rocprof_trace_decoder.hidden_latency` | Instruction-pipe overlap and hidden-latency analysis | Public utility |
 | `rocprof_trace_decoder.rcv` | ROCprof Compute Viewer JSON writer | Internal utility |
 | `rocprof_trace_decoder.att` | High-level ATT decode orchestration with explicit trace metadata | Public utility |
 | `generate_code.py` | Generates `code.json`, snapshots, and source copies from code objects | Tool module |
@@ -159,7 +160,7 @@ trace records. It has two related responsibilities.
 First, it provides ISA text to the decoder. A `CodeIndex` is normally produced
 by `generate_code_artifacts()` from explicit code objects, or loaded from an
 existing RCV `code.json` with `CodeIndex.from_code_json(path)`. It maps
-`Pc(code_object_id, address)` to instruction text, source text, line number,
+`Pc(address, code_object_id)` to instruction text, source text, line number,
 and estimated instruction size. Because `CodeIndex` implements `isa_for_pc`, it
 can be passed directly to `Decoder.parse_file(..., isa=code_index)`.
 
@@ -198,6 +199,37 @@ debug labels become RCV label rows using the viewer-compatible `; _...` form.
 No caller needs to run `generate_code.py` before using this API. Scripts that
 want `code.json` can call `generate_code_artifacts(...)` and then explicitly
 write the returned `CodeIndex`.
+
+## `rocprof_trace_decoder.hidden_latency`
+
+`hidden_latency.py` estimates how many instruction cycles overlap concurrent
+instruction-pipe activity. `analyze_hidden_latency()` takes decoded records keyed
+by shader engine and an optional `CodeIndex`:
+
+```python
+from rocprof_trace_decoder import analyze_hidden_latency
+
+result = analyze_hidden_latency(
+    {shader_engine: records},
+    code_index=code_index,
+)
+hidden_for_pc = result.by_pc[pc]
+```
+
+`HiddenLatency` reports hidden `idle`, `stall`, and `issue` cycles.
+`HiddenLatencyResult.by_scope` retains independent `(shader engine, SIMD)`
+results; `by_pc` is the sum over those scopes. Estimate non-hidden cost as
+`max(CodeEntry.latency + CodeEntry.idle - HiddenLatency.total(), 0)` because
+interval coalescing can make hidden latency exceed the aggregate total.
+
+The estimator builds busy intervals per `(shader engine, SIMD)` using the
+priority `MATRIX > VALU > VMEM/LDS/FLAT > SMEM/SALU`. Pass a `CodeIndex` so
+instructions beginning with `v_mfma*`, `v_smfma*`, `v_wmma*`, or `v_swmma*`
+can be classified as MATRIX.
+
+On gfx9, `HiddenLatency.issue` represents overlap with issue time. On gfx10+,
+it represents overlap with execution time. MI200 and MI300 results are
+therefore a coarser estimate than gfx10+ results.
 
 ## `rocprof_trace_decoder.rcv`
 

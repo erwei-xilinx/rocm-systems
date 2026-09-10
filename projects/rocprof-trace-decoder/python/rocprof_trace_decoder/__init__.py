@@ -2,6 +2,7 @@ from .att import AttTrace, generate_att_outputs
 from .bindings import Decoder, DecoderError, IsaProvider
 from .code_index import CodeEntry, CodeIndex
 from .codegen import CodeArtifacts, CodeObject, generate_code_artifacts, generate_code_index
+from .hidden_latency import HiddenLatency, HiddenLatencyResult, analyze_hidden_latency
 from .records import *
 from .records import __all__ as _record_names
 from ._version import __version__
@@ -16,6 +17,9 @@ __all__ = [
     "CodeEntry",
     "CodeIndex",
     "CodeObject",
+    "HiddenLatency",
+    "HiddenLatencyResult",
+    "analyze_hidden_latency",
     "generate_code_artifacts",
     "generate_code_index",
     "generate_att_outputs",

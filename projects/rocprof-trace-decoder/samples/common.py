@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,7 @@ from rocprof_trace_decoder import (
 )
 
 CODE_SUFFIXES = {".out", ".co", ".hsaco"}
+SHADER_ENGINE_RE = re.compile(r"_shader_engine_(\d+)_\d+\.att$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,11 @@ def decode_traces(
                 print(f"Warning: {path}: {decoder.info_string(info)}", file=sys.stderr)
             decoded.append(DecodedTrace(path=path, records=records))
     return decoded
+
+
+def shader_engine_from_path(path: Path, fallback: int) -> int:
+    match = SHADER_ENGINE_RE.search(path.name)
+    return int(match.group(1)) if match else fallback
 
 
 def prepare_output_dir(path: Path) -> Path:
