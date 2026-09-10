@@ -2410,6 +2410,11 @@ protected:
 
         ASSERT_MPI_EQ(hipSuccess, hipStreamBeginCapture(getActiveStream(), hipStreamCaptureModeThreadLocal));
 
+        auto windowCleanup = makeScopeGuard([&]() {
+            if(sendWin) (void)ncclCommWindowDeregister(getActiveCommunicator(), sendWin);
+            if(recvWin) (void)ncclCommWindowDeregister(getActiveCommunicator(), recvWin);
+        });
+
         ASSERT_MPI_EQ(ncclSuccess, ncclCommWindowRegister(getActiveCommunicator(), sendBuf, sendBytes, &sendWin, NCCL_WIN_COLL_SYMMETRIC));
         ASSERT_MPI_EQ(ncclSuccess, ncclCommWindowRegister(getActiveCommunicator(), recvBuf, recvBytes, &recvWin, NCCL_WIN_COLL_SYMMETRIC));
         ASSERT_MPI_NE(sendWin, nullptr);
@@ -2431,21 +2436,18 @@ protected:
         ASSERT_MPI_EQ(hipSuccess, hipStreamEndCapture(getActiveStream(), &graph));
         ASSERT_MPI_NE(nullptr, graph);
 
+        // Guard the graph as soon as it exists; graphExec is null-checked until instantiated.
+        auto graphCleanup = makeScopeGuard([&]() {
+            if(graphExec) (void)hipGraphExecDestroy(graphExec);
+            if(graph) (void)hipGraphDestroy(graph);
+        });
+
         size_t numGraphNodes = 0;
         ASSERT_MPI_EQ(hipSuccess, hipGraphGetNodes(graph, nullptr, &numGraphNodes));
         ASSERT_MPI_GT(numGraphNodes, 0u);
         TEST_INFO("GraphCapture_WindowRegister %s captured graph with %zu nodes", collectiveName(collective), numGraphNodes);
 
         ASSERT_MPI_EQ(hipSuccess, hipGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
-
-        auto graphCleanup = makeScopeGuard([&]() {
-            if(graphExec) (void)hipGraphExecDestroy(graphExec);
-            if(graph) (void)hipGraphDestroy(graph);
-        });
-        auto windowCleanup = makeScopeGuard([&]() {
-            if(sendWin) (void)ncclCommWindowDeregister(getActiveCommunicator(), sendWin);
-            if(recvWin) (void)ncclCommWindowDeregister(getActiveCommunicator(), recvWin);
-        });
 
         constexpr int kGraphLaunches = 2;
         for(int launch = 0; launch < kGraphLaunches; ++launch)
@@ -2477,7 +2479,7 @@ protected:
             comm->symmetricSupport && comm->isAllDirectNvlink;
 
         bool expectSymmetric = symmetricRuntimeAvailable;
-        if(comm->nNodes > 1)
+        if(comm->devrState.lsaSize < comm->nRanks)
         {
             switch(collective)
             {
@@ -2500,10 +2502,10 @@ protected:
         const REGLogChecker checker = getLogChecker();
         const bool sawSymmetric = checker.usedSymmetricCollective(collectiveName(collective));
         const bool sawLegacy = checker.usedLegacyCollective(collectiveName(collective));
-        TEST_INFO("%s path: nNodes=%d symmetricSupport=%d isAllDirectNvlink=%d "
+        TEST_INFO("%s path: nNodes=%d lsaSize=%d nRanks=%d symmetricSupport=%d isAllDirectNvlink=%d "
                   "hasLsaMultimem=%d expected=%s observedSymmetric=%d observedLegacy=%d",
-                  collectiveName(collective), comm->nNodes, comm->symmetricSupport,
-                  static_cast<int>(comm->isAllDirectNvlink),
+                  collectiveName(collective), comm->nNodes, comm->devrState.lsaSize, comm->nRanks,
+                  comm->symmetricSupport, static_cast<int>(comm->isAllDirectNvlink),
                   static_cast<int>(comm->symkState.hasLsaMultimem),
                   expectSymmetric ? "symmetric" : "legacy", static_cast<int>(sawSymmetric),
                   static_cast<int>(sawLegacy));
@@ -2533,7 +2535,7 @@ protected:
                       collectiveName(collective));
         }
 
-        ASSERT_MPI_EQ(ncclSuccess,ncclCommWindowDeregister(getActiveCommunicator(), sendWin));
+        ASSERT_MPI_EQ(ncclSuccess, ncclCommWindowDeregister(getActiveCommunicator(), sendWin));
         ASSERT_MPI_EQ(ncclSuccess, ncclCommWindowDeregister(getActiveCommunicator(), recvWin));
         sendWin = nullptr;
         recvWin = nullptr;
