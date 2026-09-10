@@ -169,6 +169,11 @@ namespace {
         MPI_Allreduce(MPI_IN_PLACE, &result, 1, MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
         return result;
     }
+
+    bool agreedOnAllRanks(bool localOk)
+    {
+        return allreduceMin(localOk ? 1 : 0) != 0;
+    }
 }
 
 __global__ void samplePeerFloatsKernel(const float* peer, size_t count, float* out)
@@ -257,9 +262,17 @@ protected:
         return win;
     }
 
-    // No node-count gate: every check below is a property the whole communicator
-    // agrees on, so no rank is left alone in a collective.
+    // No node-count gate. Most checks below are communicator-wide properties, but
+    // the ncclMemAlloc probe is per-GPU and MPI_Comm_split can fail on one rank, so
+    // the local verdict is agreed across the job before any caller acts on it:
+    // otherwise that rank skips while its peers block in the next collective and a
+    // single failed allocation is reported as a runner timeout instead of a skip.
     bool setupForSymmetric(int minRanks = MIN_RANKS)
+    {
+        return agreedOnAllRanks(setupSymmetricLocal(minRanks));
+    }
+
+    bool setupSymmetricLocal(int minRanks)
     {
         const char* cuMemEnv = std::getenv("NCCL_CUMEM_ENABLE");
         if (!cuMemEnv || std::string(cuMemEnv) != "1") return false;
@@ -360,7 +373,8 @@ protected:
     {
         if (!setupForSymmetric(minRanks)) return false;
 
-        if (!deviceApiSupport_) return false;
+        // Agreed for the same reason: allreduceMax below is a world collective.
+        if (!agreedOnAllRanks(deviceApiSupport_)) return false;
 
         asymChunkCache() = static_cast<size_t>(allreduceMax(localAsymChunkBytes()));
 
@@ -394,6 +408,13 @@ protected:
 
         ncclWindow_t win = registerWindow(comm, buf, bufSize);
         ASSERT_MPI_NE(win, nullptr);
+
+        void* inBounds = nullptr;
+        ASSERT_MPI_EQ(ncclSuccess, ncclGetPeerDevicePointer(win, bufSize - 1, rank, &inBounds));
+        ASSERT_MPI_NE(inBounds, nullptr);
+
+        void* pastEnd = nullptr;
+        ASSERT_MPI_EQ(ncclInvalidArgument, ncclGetPeerDevicePointer(win, bufSize, rank, &pastEnd));
 
         const uint64_t minBytes = allreduceMin(bufSize);
         const uint64_t maxBytes = allreduceMax(bufSize);
