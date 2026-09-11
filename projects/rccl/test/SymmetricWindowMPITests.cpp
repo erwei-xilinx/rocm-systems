@@ -26,7 +26,7 @@
  *   mpirun -np 8 --bind-to none -x NCCL_DEBUG=INFO \
  *     ./rccl-UnitTestsMPI --gtest_filter=SymWin_AllReduce.*
  *   mpirun -np 8 --bind-to none -x NCCL_CUMEM_ENABLE=1 \
- *     ./rccl-UnitTestsMPI --gtest_filter=SymWin_Asym*
+ *     ./rccl-UnitTestsMPI --gtest_filter=SymWin_Asym*:SymWin_WindowLifecycle.*Asym*
  */
 
 #include "DeviceBufferHelpers.hpp"
@@ -38,6 +38,7 @@
 #include "nccl_device.h"
 #include <cstdint>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 #ifdef MPI_TESTS_ENABLED
@@ -89,9 +90,7 @@ namespace {
         return static_cast<float>(Fp8T(acc));
     }
 
-    // Aligned to the granularity ncclMemAlloc rounds up to, so that per-rank
-    // multiples of this chunk stay distinct instead of collapsing onto one size.
-    // Answers per rank; the fixture agrees on one value across ranks.
+    // Align to ncclMemAlloc granularity so rank multiples stay distinct.
     size_t localAsymChunkBytes()
     {
         constexpr size_t requested = 2 * 1024 * 1024;
@@ -121,9 +120,7 @@ namespace {
 
     size_t asymChunkBytes()
     {
-        size_t& cached = asymChunkCache();
-        if (cached == 0) cached = localAsymChunkBytes();
-        return cached;
+        return asymChunkCache();
     }
 
     enum class SizePattern {
@@ -204,9 +201,7 @@ protected:
     std::vector<NcclBufInfo> allocatedBufs_;
     std::vector<WinInfo> registeredWins_;
 
-    // Ranks a window is load/store reachable from. A team never spans a node and
-    // is what flat-VA slots are sized over (ncclDevrMemory::lsaMaxSize), so the
-    // peer-pointer invariants below hold per team rather than per job.
+    // LSA team: load/store reachability, never spans a node.
     MPI_Comm lsaComm_ = MPI_COMM_NULL;
     int lsaSize_ = 1;
     int lsaRank_ = 0;
@@ -262,61 +257,71 @@ protected:
         return win;
     }
 
-    // No node-count gate. Most checks below are communicator-wide properties, but
-    // the ncclMemAlloc probe is per-GPU and MPI_Comm_split can fail on one rank, so
-    // the local verdict is agreed across the job before any caller acts on it:
-    // otherwise that rank skips while its peers block in the next collective and a
-    // single failed allocation is reported as a runner timeout instead of a skip.
-    bool setupForSymmetric(int minRanks = MIN_RANKS)
+    void forgetWindow(ncclWindow_t win)
     {
-        return agreedOnAllRanks(setupSymmetricLocal(minRanks));
+        for (auto& info : registeredWins_) {
+            if (info.win == win) info.win = nullptr;
+        }
     }
 
-    bool setupSymmetricLocal(int minRanks)
+    void deregisterTrackedWindow(ncclComm_t comm, ncclWindow_t win)
+    {
+        ASSERT_MPI_EQ(ncclSuccess, ncclCommWindowDeregister(comm, win));
+        forgetWindow(win);
+    }
+
+    void assertWindowHonoursSize(ncclWindow_t win, size_t bufSize, int rank)
+    {
+        void* inBounds = nullptr;
+        ASSERT_MPI_EQ(ncclSuccess, ncclGetPeerDevicePointer(win, bufSize - 1, rank, &inBounds));
+        ASSERT_MPI_NE(inBounds, nullptr);
+
+        void* pastEnd = nullptr;
+        ASSERT_MPI_EQ(ncclInvalidArgument, ncclGetPeerDevicePointer(win, bufSize, rank, &pastEnd));
+    }
+
+    // Agree on each local check before the next collective, or a skip hangs.
+    bool setupForSymmetric(int minRanks = MIN_RANKS)
     {
         const char* cuMemEnv = std::getenv("NCCL_CUMEM_ENABLE");
-        if (!cuMemEnv || std::string(cuMemEnv) != "1") return false;
+        const bool envOk = cuMemEnv && std::string(cuMemEnv) == "1";
+        if (!agreedOnAllRanks(envOk)) return false;
 
         if (!validateTestPrerequisites(minRanks)) return false;
         if (createTestCommunicator() != ncclSuccess) return false;
 
         ncclComm_t comm = getActiveCommunicator();
 
-        // ncclCommWindowRegister returns success and a null window only when both
-        // supports are absent; host RMA alone still hands back a real window.
+        // Null window only when both supports are absent; host RMA still registers.
         ncclCommProperties_t props = NCCL_COMM_PROPERTIES_INITIALIZER;
-        if (ncclCommQueryProperties(comm, &props) != ncclSuccess) return false;
-        if (!props.deviceApiSupport && !props.hostRmaSupport) return false;
-        deviceApiSupport_ = props.deviceApiSupport;
-        nLsaTeams_ = props.nLsaTeams;
+        bool localOk = ncclCommQueryProperties(comm, &props) == ncclSuccess &&
+                       (props.deviceApiSupport || props.hostRmaSupport);
+        if (localOk) {
+            deviceApiSupport_ = props.deviceApiSupport;
+            nLsaTeams_ = props.nLsaTeams;
+        }
+        if (!agreedOnAllRanks(localOk)) return false;
 
-        if (!setupLsaComm(comm)) return false;
-
-        // Verify ncclMemAlloc works (proxy check for VMM/symmetric support)
-        void* testBuf = nullptr;
-        ncclResult_t res = ncclMemAlloc(&testBuf, 4096);
-        if (res != ncclSuccess || testBuf == nullptr) return false;
-        ncclMemFree(testBuf);
-
-        return true;
-    }
-
-    // Teams are disjoint blocks of consecutive world ranks, so the team leader's
-    // world rank is a valid split color.
-    bool setupLsaComm(ncclComm_t comm)
-    {
         ncclTeam_t lsa = ncclTeamLsa(comm);
-        if (lsa.nRanks <= 0) return false; // device runtime failed to initialize
-
-        lsaSize_ = lsa.nRanks;
-        lsaRank_ = lsa.rank;
-        lsaBase_ = ncclTeamRankToWorld(comm, lsa, 0);
+        localOk = lsa.nRanks > 0;
+        if (localOk) {
+            lsaSize_ = lsa.nRanks;
+            lsaRank_ = lsa.rank;
+            lsaBase_ = ncclTeamRankToWorld(comm, lsa, 0);
+        }
+        if (!agreedOnAllRanks(localOk)) return false;
 
         int worldRank = 0;
         MPI_Comm_rank(MPI_COMM_WORLD, &worldRank);
-
         if (lsaComm_ != MPI_COMM_NULL) MPI_Comm_free(&lsaComm_);
-        return MPI_Comm_split(MPI_COMM_WORLD, lsaBase_, worldRank, &lsaComm_) == MPI_SUCCESS;
+        localOk = MPI_Comm_split(MPI_COMM_WORLD, lsaBase_, worldRank, &lsaComm_) == MPI_SUCCESS;
+        if (!agreedOnAllRanks(localOk)) return false;
+
+        void* testBuf = nullptr;
+        ncclResult_t res = ncclMemAlloc(&testBuf, 4096);
+        localOk = res == ncclSuccess && testBuf != nullptr;
+        if (localOk) ncclMemFree(testBuf);
+        return agreedOnAllRanks(localOk);
     }
 
     uint64_t lsaTeamMin(uint64_t value) const
@@ -372,8 +377,6 @@ protected:
     bool setupForAsymmetric(int minRanks = MIN_RANKS)
     {
         if (!setupForSymmetric(minRanks)) return false;
-
-        // Agreed for the same reason: allreduceMax below is a world collective.
         if (!agreedOnAllRanks(deviceApiSupport_)) return false;
 
         asymChunkCache() = static_cast<size_t>(allreduceMax(localAsymChunkBytes()));
@@ -384,15 +387,13 @@ protected:
         return true;
     }
 
-    // Element count that is inside every rank's window.
     template<typename T>
     size_t commonCount(size_t localBytes)
     {
         return static_cast<size_t>(allreduceMin(localBytes)) / sizeof(T);
     }
 
-    // allocBytes of 0 allocates exactly what is registered; a larger, rank-uniform
-    // value isolates a differing registered size from a differing allocation.
+    // allocBytes=0 registers the full allocation; a larger value isolates size from alloc.
     void registerAsymmetricOnly(SizePattern pattern, size_t allocBytes = 0)
     {
         ncclComm_t comm = getActiveCommunicator();
@@ -408,13 +409,7 @@ protected:
 
         ncclWindow_t win = registerWindow(comm, buf, bufSize);
         ASSERT_MPI_NE(win, nullptr);
-
-        void* inBounds = nullptr;
-        ASSERT_MPI_EQ(ncclSuccess, ncclGetPeerDevicePointer(win, bufSize - 1, rank, &inBounds));
-        ASSERT_MPI_NE(inBounds, nullptr);
-
-        void* pastEnd = nullptr;
-        ASSERT_MPI_EQ(ncclInvalidArgument, ncclGetPeerDevicePointer(win, bufSize, rank, &pastEnd));
+        assertWindowHonoursSize(win, bufSize, rank);
 
         const uint64_t minBytes = allreduceMin(bufSize);
         const uint64_t maxBytes = allreduceMax(bufSize);
@@ -436,8 +431,6 @@ protected:
                   static_cast<unsigned long long>(teamMax));
     }
 
-    // AllReduce over the range every rank's window covers. Bytes registered past
-    // that range are fenced with a sentinel that must survive.
     void runAsymAllReduce(SizePattern pattern, bool inPlace, bool registerRecv,
                           bool equalAllocations, int iterations)
     {
@@ -451,7 +444,6 @@ protected:
         ncclCommCount(comm, &nRanks);
 
         const size_t regSize = asymBytes(pattern, rank, nRanks);
-        // Smallest rank-uniform size that fits every rank's registration.
         const size_t allocSize =
             equalAllocations ? static_cast<size_t>(allreduceMax(regSize)) : regSize;
 
@@ -468,8 +460,6 @@ protected:
         const size_t count = commonCount<T>(regSize);
         ASSERT_MPI_GT(count, 0u);
 
-        // Zero on the rank owning the job minimum, so the fill and check below
-        // report through a local flag rather than diverging on a collective.
         const size_t surplusCount = regSize / sizeof(T) - count;
         T* const surplus = static_cast<T*>(recvBuf) + count;
 
@@ -503,8 +493,86 @@ protected:
                   surplusCount * sizeof(T));
     }
 
-    // Peers outside the LSA team resolve to nullptr and are skipped, so the
-    // result holds only reachable ranks, in increasing world-rank order.
+    enum class PaddedCollective { AllGather, ReduceScatter };
+
+    void runAsymPaddedCollective(PaddedCollective kind)
+    {
+        using T = float;
+        constexpr T kSentinel = static_cast<T>(-12345.0);
+
+        ncclComm_t comm = getActiveCommunicator();
+        hipStream_t stream = getActiveStream();
+        int rank, nRanks;
+        ncclCommUserRank(comm, &rank);
+        ncclCommCount(comm, &nRanks);
+
+        const size_t chunk   = asymChunkBytes();
+        const size_t padding = chunk * rank;
+        const bool isAllGather = kind == PaddedCollective::AllGather;
+        const size_t sendSize = isAllGather ? chunk + padding : chunk * nRanks + padding;
+        const size_t recvSize = isAllGather ? chunk * nRanks + padding : chunk + padding;
+
+        void* sendBuf = allocNcclBuf(sendSize);
+        void* recvBuf = allocNcclBuf(recvSize);
+        ASSERT_MPI_NE(sendBuf, nullptr);
+        ASSERT_MPI_NE(recvBuf, nullptr);
+
+        ASSERT_MPI_NE(registerWindow(comm, sendBuf, sendSize), nullptr);
+        ASSERT_MPI_NE(registerWindow(comm, recvBuf, recvSize), nullptr);
+
+        const size_t countPerRank = chunk / sizeof(T);
+        const size_t sendUsed = isAllGather ? countPerRank : countPerRank * nRanks;
+        const size_t recvUsed = isAllGather ? countPerRank * nRanks : countPerRank;
+        const size_t sendSurplus = sendSize / sizeof(T) - sendUsed;
+        const size_t recvSurplus = recvSize / sizeof(T) - recvUsed;
+
+        initSendBuffer<T>(sendBuf, sendUsed, rank);
+
+        hipError_t fillStatus = hipSuccess;
+        if (sendSurplus > 0) {
+            fillStatus = initializeBufferWithPattern<T>(
+                static_cast<T*>(sendBuf) + sendUsed, sendSurplus,
+                [](size_t) { return kSentinel; });
+        }
+        ASSERT_MPI_EQ(hipSuccess, fillStatus);
+        if (recvSurplus > 0) {
+            fillStatus = initializeBufferWithPattern<T>(
+                static_cast<T*>(recvBuf) + recvUsed, recvSurplus,
+                [](size_t) { return kSentinel; });
+        }
+        ASSERT_MPI_EQ(hipSuccess, fillStatus);
+
+        if (isAllGather) {
+            ASSERT_MPI_EQ(ncclSuccess,
+                ncclAllGather(sendBuf, recvBuf, countPerRank, ncclFloat, comm, stream));
+        } else {
+            ASSERT_MPI_EQ(ncclSuccess,
+                ncclReduceScatter(sendBuf, recvBuf, countPerRank, ncclFloat, ncclSum, comm, stream));
+        }
+        ASSERT_MPI_EQ(hipSuccess, hipStreamSynchronize(stream));
+
+        if (isAllGather) {
+            ASSERT_MPI_TRUE(checkAllGatherResult<T>(recvBuf, countPerRank, nRanks));
+        } else {
+            ASSERT_MPI_TRUE(checkReduceScatterResult<T>(recvBuf, countPerRank, nRanks));
+        }
+
+        bool surplusIntact = true;
+        if (sendSurplus > 0) {
+            surplusIntact = verifyBufferData<T>(static_cast<T*>(sendBuf) + sendUsed, sendSurplus,
+                [](size_t) { return kSentinel; });
+        }
+        if (surplusIntact && recvSurplus > 0) {
+            surplusIntact = verifyBufferData<T>(static_cast<T*>(recvBuf) + recvUsed, recvSurplus,
+                [](size_t) { return kSentinel; });
+        }
+        ASSERT_MPI_TRUE(surplusIntact);
+
+        TEST_INFO("Rank %d: %s with %zu/%zu byte windows passed (%zu surplus bytes untouched)",
+                  rank, isAllGather ? "AllGather" : "ReduceScatter", sendSize, recvSize,
+                  (sendSurplus + recvSurplus) * sizeof(T));
+    }
+
     bool collectPeerBasePointers(ncclWindow_t win, int nRanks,
                                  std::vector<int>& outPeers,
                                  std::vector<uintptr_t>& outPtrs)
@@ -521,7 +589,7 @@ protected:
         return true;
     }
 
-    // 0 when the pointers are not evenly strided (IPC-backed rather than flat VA).
+    // 0 if not evenly strided (IPC-backed rather than flat VA).
     static size_t uniformStride(const std::vector<uintptr_t>& ptrs)
     {
         if (ptrs.size() < 2) return 0;
@@ -1114,9 +1182,6 @@ TEST_F(SymWin_AsymRegister, SubRangeOfEqualAllocations)
 
     int nRanks = 0;
     ncclCommCount(getActiveCommunicator(), &nRanks);
-
-    // Equal allocations isolate a differing registered size from a differing
-    // backing allocation.
     registerAsymmetricOnly(SizePattern::Ascending, asymChunkBytes() * nRanks);
 }
 
@@ -1172,39 +1237,7 @@ TEST_F(SymWin_AsymCollective, AllGather_PaddedWindows)
         GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
     }
 
-    using T = float;
-    ncclComm_t comm = getActiveCommunicator();
-    hipStream_t stream = getActiveStream();
-    int rank, nRanks;
-    ncclCommUserRank(comm, &rank);
-    ncclCommCount(comm, &nRanks);
-
-    // AllGather needs one count for all ranks, so rank-dependent padding is what
-    // makes the window sizes differ while the used range stays valid everywhere.
-    const size_t chunk    = asymChunkBytes();
-    const size_t padding  = chunk * rank;
-    const size_t sendSize = chunk + padding;
-    const size_t recvSize = chunk * nRanks + padding;
-
-    void* sendBuf = allocNcclBuf(sendSize);
-    void* recvBuf = allocNcclBuf(recvSize);
-    ASSERT_MPI_NE(sendBuf, nullptr);
-    ASSERT_MPI_NE(recvBuf, nullptr);
-
-    ncclWindow_t sendWin = registerWindow(comm, sendBuf, sendSize);
-    ncclWindow_t recvWin = registerWindow(comm, recvBuf, recvSize);
-    ASSERT_MPI_NE(sendWin, nullptr);
-    ASSERT_MPI_NE(recvWin, nullptr);
-
-    const size_t countPerRank = chunk / sizeof(T);
-    initSendBuffer<T>(sendBuf, countPerRank, rank);
-
-    ASSERT_MPI_EQ(ncclSuccess,
-        ncclAllGather(sendBuf, recvBuf, countPerRank, ncclFloat, comm, stream));
-    ASSERT_MPI_EQ(hipSuccess, hipStreamSynchronize(stream));
-
-    ASSERT_MPI_TRUE(checkAllGatherResult<T>(recvBuf, countPerRank, nRanks));
-    TEST_INFO("Rank %d: AllGather with %zu/%zu byte windows passed", rank, sendSize, recvSize);
+    runAsymPaddedCollective(PaddedCollective::AllGather);
 }
 
 TEST_F(SymWin_AsymCollective, ReduceScatter_PaddedWindows)
@@ -1213,37 +1246,7 @@ TEST_F(SymWin_AsymCollective, ReduceScatter_PaddedWindows)
         GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
     }
 
-    using T = float;
-    ncclComm_t comm = getActiveCommunicator();
-    hipStream_t stream = getActiveStream();
-    int rank, nRanks;
-    ncclCommUserRank(comm, &rank);
-    ncclCommCount(comm, &nRanks);
-
-    const size_t chunk    = asymChunkBytes();
-    const size_t padding  = chunk * rank;
-    const size_t sendSize = chunk * nRanks + padding;
-    const size_t recvSize = chunk + padding;
-
-    void* sendBuf = allocNcclBuf(sendSize);
-    void* recvBuf = allocNcclBuf(recvSize);
-    ASSERT_MPI_NE(sendBuf, nullptr);
-    ASSERT_MPI_NE(recvBuf, nullptr);
-
-    ncclWindow_t sendWin = registerWindow(comm, sendBuf, sendSize);
-    ncclWindow_t recvWin = registerWindow(comm, recvBuf, recvSize);
-    ASSERT_MPI_NE(sendWin, nullptr);
-    ASSERT_MPI_NE(recvWin, nullptr);
-
-    const size_t countPerRank = chunk / sizeof(T);
-    initSendBuffer<T>(sendBuf, countPerRank * nRanks, rank);
-
-    ASSERT_MPI_EQ(ncclSuccess,
-        ncclReduceScatter(sendBuf, recvBuf, countPerRank, ncclFloat, ncclSum, comm, stream));
-    ASSERT_MPI_EQ(hipSuccess, hipStreamSynchronize(stream));
-
-    ASSERT_MPI_TRUE(checkReduceScatterResult<T>(recvBuf, countPerRank, nRanks));
-    TEST_INFO("Rank %d: ReduceScatter with %zu/%zu byte windows passed", rank, sendSize, recvSize);
+    runAsymPaddedCollective(PaddedCollective::ReduceScatter);
 }
 
 TEST_F(SymWin_AsymCollective, AllReduce_RepeatedIterations)
@@ -1252,7 +1255,6 @@ TEST_F(SymWin_AsymCollective, AllReduce_RepeatedIterations)
         GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
     }
 
-    // Catches per-op state derived from the first operation only.
     runAsymAllReduce(SizePattern::ExtremeRatio, /*inPlace=*/true, /*registerRecv=*/false,
                      /*equalAllocations=*/false, /*iterations=*/3);
 }
@@ -1300,9 +1302,6 @@ TEST_F(SymWin_AsymLsa, PeerContent_WithinCommonRange)
     std::vector<uintptr_t> peerPtrs;
     ASSERT_MPI_TRUE(collectPeerBasePointers(win, nRanks, peers, peerPtrs));
     ASSERT_MPI_GT(peers.size(), 0u);
-
-    // A pointer resolving outside the team would promise load/store access across
-    // nodes; a missing one would mean a team member became unreachable.
     ASSERT_MPI_EQ(peers.size(), static_cast<size_t>(lsaSize_));
     bool peersWithinTeam = true;
     for (int peer : peers) {
@@ -1314,12 +1313,17 @@ TEST_F(SymWin_AsymLsa, PeerContent_WithinCommonRange)
     }
     ASSERT_MPI_TRUE(peersWithinTeam);
 
-    // Failures are accumulated so the per-peer loop issues no collectives itself.
     bool allOk = true;
     for (size_t i = 0; i < peers.size(); i++) {
         const int peer = peers[i];
+        const size_t peerElems = asymBytes(SizePattern::Ascending, peer, nRanks) / sizeof(T);
+        if (peerElems == 0) {
+            TEST_WARN("Rank %d: peer %d registered an empty window", rank, peer);
+            allOk = false;
+            continue;
+        }
         samplePeerFloatsKernel<<<1, 1, 0, stream>>>(
-            reinterpret_cast<const float*>(peerPtrs[i]), commonElems, dSamples);
+            reinterpret_cast<const float*>(peerPtrs[i]), peerElems, dSamples);
         if (hipStreamSynchronize(stream) != hipSuccess) {
             TEST_WARN("Rank %d: peer %d sample kernel failed", rank, peer);
             allOk = false;
@@ -1345,8 +1349,8 @@ TEST_F(SymWin_AsymLsa, PeerContent_WithinCommonRange)
     ASSERT_MPI_TRUE(allOk);
 
     MPI_Barrier(MPI_COMM_WORLD);
-    TEST_INFO("Rank %d: verified %zu peer windows in LSA team of %d over %zu common bytes",
-              rank, peers.size(), lsaSize_, commonElems * sizeof(T));
+    TEST_INFO("Rank %d: verified %zu peer windows in LSA team of %d, each sampled to its own size",
+              rank, peers.size(), lsaSize_);
 }
 
 TEST_F(SymWin_AsymLsa, PeerPointerStride_IndependentOfRankSizes)
@@ -1360,8 +1364,6 @@ TEST_F(SymWin_AsymLsa, PeerPointerStride_IndependentOfRankSizes)
     ncclCommUserRank(comm, &rank);
     ncclCommCount(comm, &nRanks);
 
-    // Asymmetric first, so the window after it must clear the team maximum
-    // rather than this rank's own size.
     const size_t asymSize = asymBytes(SizePattern::SingleLarger, rank, nRanks);
     void* asymBuf = allocNcclBuf(asymSize);
     ASSERT_MPI_NE(asymBuf, nullptr);
@@ -1373,16 +1375,14 @@ TEST_F(SymWin_AsymLsa, PeerPointerStride_IndependentOfRankSizes)
     ASSERT_MPI_TRUE(collectPeerBasePointers(asymWin, nRanks, asymPeers, asymPtrs));
     const size_t asymStride = uniformStride(asymPtrs);
 
-    // A stride needs two reachable ranks and a flat-VA mapping; the logged team
-    // size tells a single-member team apart from an IPC-backed window.
     TEST_INFO("Rank %d: LSA team size %d, stride %zu", rank, lsaSize_, asymStride);
-    if (auto reason = mpiCoordinatedSkipReason(asymStride == 0,
+    if (auto reason = mpiCoordinatedSkipReason(lsaSize_ < 2,
             "Needs an LSA team of 2+ ranks with a flat-VA symmetric mapping");
         !reason.empty()) {
         GTEST_SKIP() << reason;
     }
+    ASSERT_MPI_NE(asymStride, static_cast<size_t>(0));
 
-    // Equal-size baseline the asymmetric sizes must not have moved.
     const size_t symSize = asymChunkBytes();
     void* symBuf = allocNcclBuf(symSize);
     ASSERT_MPI_NE(symBuf, nullptr);
@@ -1393,12 +1393,7 @@ TEST_F(SymWin_AsymLsa, PeerPointerStride_IndependentOfRankSizes)
     std::vector<uintptr_t> symPtrs;
     ASSERT_MPI_TRUE(collectPeerBasePointers(symWin, nRanks, symPeers, symPtrs));
     const size_t symStride = uniformStride(symPtrs);
-
-    // The stride is the per-rank flat-VA reservation, fixed at init.
     ASSERT_MPI_EQ(symStride, asymStride);
-
-    // Window slots are sized from the LSA team maximum, not from what this rank
-    // registered, so ranks holding one chunk must still clear chunk * nRanks.
     ASSERT_MPI_EQ(symPeers[0], asymPeers[0]);
     const size_t asymTeamMax = static_cast<size_t>(lsaTeamMax(asymSize));
     const size_t symTeamMax  = static_cast<size_t>(lsaTeamMax(symSize));
@@ -1441,8 +1436,7 @@ TEST_F(SymWin_AsymLsa, PointerOffsetAtLocalWindowEnd_Rejected)
     ptr = nullptr;
     ASSERT_MPI_EQ(ncclInvalidArgument, ncclGetPeerDevicePointer(win, bufSize, rank, &ptr));
 
-    // The bound is the local window size only: an offset past a smaller peer's
-    // end still resolves. Ascending puts the smallest window on lsaBase_.
+    // Bound is local win->size; an offset past a smaller peer still resolves.
     const size_t peerSize = asymBytes(SizePattern::Ascending, lsaBase_, nRanks);
     bool peerOverrunResolves = true;
     if (bufSize > peerSize) {
@@ -1481,10 +1475,7 @@ TEST_F(SymWin_WindowLifecycle, RegisterDeregister_Basic)
     ncclWindow_t win = registerWindow(comm, buf, bufSize);
     ASSERT_MPI_NE(win, nullptr);
 
-    ASSERT_MPI_EQ(ncclSuccess, ncclCommWindowDeregister(comm, win));
-
-    // Null out tracked entry so TearDown skips double-deregister
-    registeredWins_.back().win = nullptr;
+    deregisterTrackedWindow(comm, win);
 
     TEST_INFO("Rank %d: RegisterDeregister_Basic passed", rank);
 }
@@ -1537,12 +1528,10 @@ TEST_F(SymWin_WindowLifecycle, RepeatedRegisterDeregister)
 
     const int iterations = 3;
     for (int i = 0; i < iterations; i++) {
-        ncclWindow_t win = nullptr;
-        ASSERT_MPI_EQ(ncclSuccess,
-            ncclCommWindowRegister(comm, buf, bufSize, &win, NCCL_WIN_COLL_SYMMETRIC));
+        ncclWindow_t win = registerWindow(comm, buf, bufSize);
         ASSERT_MPI_NE(win, nullptr);
 
-        ASSERT_MPI_EQ(ncclSuccess, ncclCommWindowDeregister(comm, win));
+        deregisterTrackedWindow(comm, win);
     }
 
     TEST_INFO("Rank %d: RepeatedRegisterDeregister passed (%d iterations)",
@@ -1575,6 +1564,7 @@ TEST_F(SymWin_WindowLifecycle, MultipleAsymmetricWindows)
 
         wins[i] = registerWindow(comm, buf, bufSize);
         ASSERT_MPI_NE(wins[i], nullptr);
+        assertWindowHonoursSize(wins[i], bufSize, rank);
 
         ASSERT_MPI_GT(allreduceMax(bufSize), allreduceMin(bufSize));
     }
@@ -1605,12 +1595,10 @@ TEST_F(SymWin_WindowLifecycle, RepeatedRegisterDeregister_AsymmetricSizes)
 
     const int iterations = 3;
     for (int i = 0; i < iterations; i++) {
-        ncclWindow_t win = nullptr;
-        ASSERT_MPI_EQ(ncclSuccess,
-            ncclCommWindowRegister(comm, buf, bufSize, &win, NCCL_WIN_COLL_SYMMETRIC));
+        ncclWindow_t win = registerWindow(comm, buf, bufSize);
         ASSERT_MPI_NE(win, nullptr);
 
-        ASSERT_MPI_EQ(ncclSuccess, ncclCommWindowDeregister(comm, win));
+        deregisterTrackedWindow(comm, win);
     }
 
     TEST_INFO("Rank %d: %d asymmetric register/deregister cycles at %zu bytes passed",
@@ -1628,25 +1616,18 @@ TEST_F(SymWin_WindowLifecycle, ReregisterWithDifferentAsymmetricPattern)
     ncclCommUserRank(comm, &rank);
     ncclCommCount(comm, &nRanks);
 
-    // One allocation large enough for either pattern, so only the registered size
-    // changes between the two registrations.
     void* buf = allocNcclBuf(asymChunkBytes() * nRanks);
     ASSERT_MPI_NE(buf, nullptr);
 
     const size_t firstSize = asymBytes(SizePattern::Ascending, rank, nRanks);
-    ncclWindow_t firstWin = nullptr;
-    ASSERT_MPI_EQ(ncclSuccess,
-        ncclCommWindowRegister(comm, buf, firstSize, &firstWin, NCCL_WIN_COLL_SYMMETRIC));
+    ncclWindow_t firstWin = registerWindow(comm, buf, firstSize);
     ASSERT_MPI_NE(firstWin, nullptr);
-    ASSERT_MPI_EQ(ncclSuccess, ncclCommWindowDeregister(comm, firstWin));
+    deregisterTrackedWindow(comm, firstWin);
 
-    // Which rank registers the most flips between the two patterns.
     const size_t secondSize = asymBytes(SizePattern::Descending, rank, nRanks);
-    ncclWindow_t secondWin = nullptr;
-    ASSERT_MPI_EQ(ncclSuccess,
-        ncclCommWindowRegister(comm, buf, secondSize, &secondWin, NCCL_WIN_COLL_SYMMETRIC));
+    ncclWindow_t secondWin = registerWindow(comm, buf, secondSize);
     ASSERT_MPI_NE(secondWin, nullptr);
-    ASSERT_MPI_EQ(ncclSuccess, ncclCommWindowDeregister(comm, secondWin));
+    deregisterTrackedWindow(comm, secondWin);
 
     TEST_INFO("Rank %d: re-registered %zu bytes after %zu bytes", rank, secondSize, firstSize);
 }
