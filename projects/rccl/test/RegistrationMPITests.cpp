@@ -2408,12 +2408,29 @@ protected:
         ncclWindow_t sendWin = nullptr;
         ncclWindow_t recvWin = nullptr;
 
-        ASSERT_MPI_EQ(hipSuccess, hipStreamBeginCapture(getActiveStream(), hipStreamCaptureModeThreadLocal));
+        bool captureActive = false;
 
         auto windowCleanup = makeScopeGuard([&]() {
             if(sendWin) (void)ncclCommWindowDeregister(getActiveCommunicator(), sendWin);
             if(recvWin) (void)ncclCommWindowDeregister(getActiveCommunicator(), recvWin);
         });
+
+        // Declared after windowCleanup so it unwinds first: an early return before
+        // hipStreamEndCapture must leave the stream idle, because the deregisters above cannot
+        // be issued into a capturing stream.
+        auto captureCleanup = makeScopeGuard([&]() {
+            if(captureActive)
+            {
+                hipGraph_t abandonedGraph = nullptr;
+                if(hipStreamEndCapture(getActiveStream(), &abandonedGraph) == hipSuccess && abandonedGraph)
+                    (void)hipGraphDestroy(abandonedGraph);
+            }
+        });
+
+        const hipError_t captureBeginStatus =
+            hipStreamBeginCapture(getActiveStream(), hipStreamCaptureModeThreadLocal);
+        captureActive = (captureBeginStatus == hipSuccess);
+        ASSERT_MPI_EQ(hipSuccess, captureBeginStatus);
 
         ASSERT_MPI_EQ(ncclSuccess, ncclCommWindowRegister(getActiveCommunicator(), sendBuf, sendBytes, &sendWin, NCCL_WIN_COLL_SYMMETRIC));
         ASSERT_MPI_EQ(ncclSuccess, ncclCommWindowRegister(getActiveCommunicator(), recvBuf, recvBytes, &recvWin, NCCL_WIN_COLL_SYMMETRIC));
@@ -2433,7 +2450,9 @@ protected:
             break;
         }
 
-        ASSERT_MPI_EQ(hipSuccess, hipStreamEndCapture(getActiveStream(), &graph));
+        const hipError_t captureEndStatus = hipStreamEndCapture(getActiveStream(), &graph);
+        if(captureEndStatus == hipSuccess) captureActive = false;
+        ASSERT_MPI_EQ(hipSuccess, captureEndStatus);
         ASSERT_MPI_NE(nullptr, graph);
 
         // Guard the graph as soon as it exists; graphExec is null-checked until instantiated.
@@ -2535,10 +2554,15 @@ protected:
                       collectiveName(collective));
         }
 
-        ASSERT_MPI_EQ(ncclSuccess, ncclCommWindowDeregister(getActiveCommunicator(), sendWin));
-        ASSERT_MPI_EQ(ncclSuccess, ncclCommWindowDeregister(getActiveCommunicator(), recvWin));
+        // Hand each window off before deregistering it: ASSERT_MPI_EQ returns on every rank when
+        // any one rank fails, so a rank that already succeeded must not leave the handle set for
+        // windowCleanup to deregister a second time.
+        ncclWindow_t sendWinToRelease = sendWin;
         sendWin = nullptr;
+        ASSERT_MPI_EQ(ncclSuccess, ncclCommWindowDeregister(getActiveCommunicator(), sendWinToRelease));
+        ncclWindow_t recvWinToRelease = recvWin;
         recvWin = nullptr;
+        ASSERT_MPI_EQ(ncclSuccess, ncclCommWindowDeregister(getActiveCommunicator(), recvWinToRelease));
 
         TEST_INFO("GraphCapture_WindowRegister %s completed via %s path",
                   collectiveName(collective), expectSymmetric ? "symmetric" : "legacy fallback");

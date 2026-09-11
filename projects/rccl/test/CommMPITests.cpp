@@ -1554,7 +1554,7 @@ TEST_F(GraphStreamOrderingConfigMPITest, EnvOverrideAppliesGraphStreamOrdering)
 
     // Set config to the opposite value; upstream NCCL envConfigOverride() must win.
     configured_graph_stream_ordering_ = (expected == 0) ? 1 : 0;
-    configured_graph_usage_mode_        = 1;
+    configured_graph_usage_mode_      = 1;
 
     ASSERT_MPI_EQ(ncclSuccess, createTestCommunicator());
 
@@ -1568,8 +1568,9 @@ TEST_F(GraphStreamOrderingConfigMPITest, EnvOverrideAppliesGraphStreamOrdering)
  * @brief graphStreamOrdering=0 with graphUsageMode=1 captures and replays AllReduce.
  *
  * Captures the same collective into two graphs and replays both, so the first/subsequent
- * capture split and the cross-graph serialEvent ordering of the origin-stream path are both
- * covered rather than just the single-capture case.
+ * capture split of the origin-stream path is covered rather than just the single-capture
+ * case. Both graphs are launched on one stream with a host sync between them, so the
+ * cross-graph serialEvent dependency is not itself exercised.
  *
  * Requires effective ordering 0. Skips when NCCL_GRAPH_STREAM_ORDERING is set to 1,
  * because upstream NCCL envConfigOverride() would override config graphStreamOrdering=0.

@@ -1511,12 +1511,19 @@ The application is responsible for ensuring correct ordering of communication
 kernels.
 
 The same bypass can be selected per communicator with the
-:c:macro:`graphStreamOrdering` field in :ref:`ncclconfig`. When that
-field is ``0`` or ``1``, it overrides ``NCCL_GRAPH_STREAM_ORDERING`` for that
+:c:macro:`graphStreamOrdering` field in :ref:`ncclconfig`. That field takes
+effect only while ``NCCL_GRAPH_STREAM_ORDERING`` is unset; when the environment
+variable is set to ``0`` or ``1`` it overrides the field on every
 communicator. Communicators on the same GPU may still set this option
 differently; NCCL does not order them with respect to each other in that case,
 so the application's obligations below apply whenever the bypass is in effect
 for a communicator—see :c:macro:`graphStreamOrdering` for details.
+
+Communicators created by ``ncclCommSplit`` with ``splitShare`` share one
+internal serialization event with their parent. Ordering ``0`` on one such
+communicator must not be combined with ``graphUsageMode=2`` on another that
+shares those resources: the mixing guarantee depends on that shared event, and
+NCCL does not detect the conflict across communicators.
 
 .. admonition:: Application responsibilities
 

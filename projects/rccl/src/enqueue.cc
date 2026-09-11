@@ -2478,10 +2478,7 @@ ncclResult_t ncclLaunchFinish(struct ncclComm* comm) {
       }
     }
     if (!useLaunchStream) {
-      if (capturing || planner->numStreams != 1 || ncclParamLaunchOrderImplicit()) {
-        NCCLCHECK(
-          ncclStrongStreamRelease(planner->capturingGraph, &comm->sharedRes->deviceStream, /*concurrent=*/false));
-      }
+      NCCLCHECK(ncclStrongStreamRelease(planner->capturingGraph, &comm->sharedRes->deviceStream, /*concurrent=*/false));
     } else {
       NCCLCHECK(ncclCudaGraphRecordEvent(planner->capturingGraph, comm->sharedRes->deviceStream.serialEvent,
                                          launchStream));
