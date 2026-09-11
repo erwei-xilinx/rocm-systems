@@ -2259,8 +2259,8 @@
         },
         {
           "name": "SymWin_AsymLsa_PeerContent",
-          "description": "Peer window contents sampled inside the range valid on every rank",
-          "test_filter": "SymWin_AsymLsa.PeerContent_WithinCommonRange"
+          "description": "Peer window contents sampled up to each peer's own registered size",
+          "test_filter": "SymWin_AsymLsa.PeerContent_UpToEachPeerSize"
         },
         {
           "name": "SymWin_AsymLsa_PeerPointerStride",
@@ -2280,7 +2280,11 @@
       "num_ranks": 16,
       "num_nodes": 2,
       "num_gpus": 8,
-      "timeout": 600
+      "timeout": 600,
+      "env_variables": {
+        "NCCL_GIN_ENABLE": "1",
+        "NCCL_GIN_TYPE": "2"
+      }
     },
 
     "symmetric_abort_checkmode_tests": {

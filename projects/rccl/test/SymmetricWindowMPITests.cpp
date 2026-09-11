@@ -208,6 +208,7 @@ protected:
     int lsaBase_ = 0; // world rank of this team's rank 0
     int nLsaTeams_ = 1;
     bool deviceApiSupport_ = false;
+    std::string skipReason_;
 
     void SetUp() override
     {
@@ -264,10 +265,12 @@ protected:
         }
     }
 
+    // Untrack first: ASSERT_MPI_EQ returns from here, not from the test body, so TearDown
+    // must not deregister a handle this rank already released.
     void deregisterTrackedWindow(ncclComm_t comm, ncclWindow_t win)
     {
-        ASSERT_MPI_EQ(ncclSuccess, ncclCommWindowDeregister(comm, win));
         forgetWindow(win);
+        ASSERT_MPI_EQ(ncclSuccess, ncclCommWindowDeregister(comm, win));
     }
 
     void assertWindowHonoursSize(ncclWindow_t win, size_t bufSize, int rank)
@@ -376,8 +379,15 @@ protected:
 
     bool setupForAsymmetric(int minRanks = MIN_RANKS)
     {
-        if (!setupForSymmetric(minRanks)) return false;
-        if (!agreedOnAllRanks(deviceApiSupport_)) return false;
+        if (!setupForSymmetric(minRanks)) {
+            skipReason_ = "Requires symmetric support with 2+ ranks";
+            return false;
+        }
+        // A separate gate: host RMA alone already satisfies setupForSymmetric.
+        if (!agreedOnAllRanks(deviceApiSupport_)) {
+            skipReason_ = "Requires device API (LSA) support on every rank";
+            return false;
+        }
 
         asymChunkCache() = static_cast<size_t>(allreduceMax(localAsymChunkBytes()));
 
@@ -452,15 +462,21 @@ protected:
         void* recvBuf = inPlace ? sendBuf : allocNcclBuf(allocSize);
         ASSERT_MPI_NE(recvBuf, nullptr);
 
-        ASSERT_MPI_NE(registerWindow(comm, sendBuf, regSize), nullptr);
+        ncclWindow_t sendWin = registerWindow(comm, sendBuf, regSize);
+        ASSERT_MPI_NE(sendWin, nullptr);
+        assertWindowHonoursSize(sendWin, regSize, rank);
         if (!inPlace && registerRecv) {
-            ASSERT_MPI_NE(registerWindow(comm, recvBuf, regSize), nullptr);
+            ncclWindow_t recvWin = registerWindow(comm, recvBuf, regSize);
+            ASSERT_MPI_NE(recvWin, nullptr);
+            assertWindowHonoursSize(recvWin, regSize, rank);
         }
 
         const size_t count = commonCount<T>(regSize);
         ASSERT_MPI_GT(count, 0u);
 
-        const size_t surplusCount = regSize / sizeof(T) - count;
+        // From allocSize, not regSize: the bytes past the registration are exactly the ones
+        // equalAllocations excludes on purpose, and they must stay untouched too.
+        const size_t surplusCount = allocSize / sizeof(T) - count;
         T* const surplus = static_cast<T*>(recvBuf) + count;
 
         hipError_t fillStatus = hipSuccess;
@@ -517,8 +533,12 @@ protected:
         ASSERT_MPI_NE(sendBuf, nullptr);
         ASSERT_MPI_NE(recvBuf, nullptr);
 
-        ASSERT_MPI_NE(registerWindow(comm, sendBuf, sendSize), nullptr);
-        ASSERT_MPI_NE(registerWindow(comm, recvBuf, recvSize), nullptr);
+        ncclWindow_t sendWin = registerWindow(comm, sendBuf, sendSize);
+        ncclWindow_t recvWin = registerWindow(comm, recvBuf, recvSize);
+        ASSERT_MPI_NE(sendWin, nullptr);
+        ASSERT_MPI_NE(recvWin, nullptr);
+        assertWindowHonoursSize(sendWin, sendSize, rank);
+        assertWindowHonoursSize(recvWin, recvSize, rank);
 
         const size_t countPerRank = chunk / sizeof(T);
         const size_t sendUsed = isAllGather ? countPerRank : countPerRank * nRanks;
@@ -1141,7 +1161,7 @@ class SymWin_AsymRegister : public SymmetricWindowTestBase {};
 TEST_F(SymWin_AsymRegister, AscendingSizes)
 {
     if (!setupForAsymmetric()) {
-        GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
+        GTEST_SKIP() << skipReason_;
     }
 
     registerAsymmetricOnly(SizePattern::Ascending);
@@ -1150,7 +1170,7 @@ TEST_F(SymWin_AsymRegister, AscendingSizes)
 TEST_F(SymWin_AsymRegister, DescendingSizes)
 {
     if (!setupForAsymmetric()) {
-        GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
+        GTEST_SKIP() << skipReason_;
     }
 
     registerAsymmetricOnly(SizePattern::Descending);
@@ -1159,7 +1179,7 @@ TEST_F(SymWin_AsymRegister, DescendingSizes)
 TEST_F(SymWin_AsymRegister, SingleRankLarger)
 {
     if (!setupForAsymmetric()) {
-        GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
+        GTEST_SKIP() << skipReason_;
     }
 
     registerAsymmetricOnly(SizePattern::SingleLarger);
@@ -1168,7 +1188,7 @@ TEST_F(SymWin_AsymRegister, SingleRankLarger)
 TEST_F(SymWin_AsymRegister, ExtremeSizeRatio)
 {
     if (!setupForAsymmetric()) {
-        GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
+        GTEST_SKIP() << skipReason_;
     }
 
     registerAsymmetricOnly(SizePattern::ExtremeRatio);
@@ -1177,7 +1197,7 @@ TEST_F(SymWin_AsymRegister, ExtremeSizeRatio)
 TEST_F(SymWin_AsymRegister, SubRangeOfEqualAllocations)
 {
     if (!setupForAsymmetric()) {
-        GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
+        GTEST_SKIP() << skipReason_;
     }
 
     int nRanks = 0;
@@ -1194,7 +1214,7 @@ class SymWin_AsymCollective : public SymmetricWindowTestBase {};
 TEST_F(SymWin_AsymCollective, AllReduce_OutOfPlace)
 {
     if (!setupForAsymmetric()) {
-        GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
+        GTEST_SKIP() << skipReason_;
     }
 
     runAsymAllReduce(SizePattern::Ascending, /*inPlace=*/false, /*registerRecv=*/true,
@@ -1204,7 +1224,7 @@ TEST_F(SymWin_AsymCollective, AllReduce_OutOfPlace)
 TEST_F(SymWin_AsymCollective, AllReduce_InPlace_SingleWindow)
 {
     if (!setupForAsymmetric()) {
-        GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
+        GTEST_SKIP() << skipReason_;
     }
 
     runAsymAllReduce(SizePattern::Descending, /*inPlace=*/true, /*registerRecv=*/false,
@@ -1214,7 +1234,7 @@ TEST_F(SymWin_AsymCollective, AllReduce_InPlace_SingleWindow)
 TEST_F(SymWin_AsymCollective, AllReduce_OnlySendWindow)
 {
     if (!setupForAsymmetric()) {
-        GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
+        GTEST_SKIP() << skipReason_;
     }
 
     runAsymAllReduce(SizePattern::SingleLarger, /*inPlace=*/false, /*registerRecv=*/false,
@@ -1224,7 +1244,7 @@ TEST_F(SymWin_AsymCollective, AllReduce_OnlySendWindow)
 TEST_F(SymWin_AsymCollective, AllReduce_SubRangeOfEqualAllocations)
 {
     if (!setupForAsymmetric()) {
-        GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
+        GTEST_SKIP() << skipReason_;
     }
 
     runAsymAllReduce(SizePattern::Ascending, /*inPlace=*/false, /*registerRecv=*/true,
@@ -1234,7 +1254,7 @@ TEST_F(SymWin_AsymCollective, AllReduce_SubRangeOfEqualAllocations)
 TEST_F(SymWin_AsymCollective, AllGather_PaddedWindows)
 {
     if (!setupForAsymmetric()) {
-        GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
+        GTEST_SKIP() << skipReason_;
     }
 
     runAsymPaddedCollective(PaddedCollective::AllGather);
@@ -1243,7 +1263,7 @@ TEST_F(SymWin_AsymCollective, AllGather_PaddedWindows)
 TEST_F(SymWin_AsymCollective, ReduceScatter_PaddedWindows)
 {
     if (!setupForAsymmetric()) {
-        GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
+        GTEST_SKIP() << skipReason_;
     }
 
     runAsymPaddedCollective(PaddedCollective::ReduceScatter);
@@ -1252,7 +1272,7 @@ TEST_F(SymWin_AsymCollective, ReduceScatter_PaddedWindows)
 TEST_F(SymWin_AsymCollective, AllReduce_RepeatedIterations)
 {
     if (!setupForAsymmetric()) {
-        GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
+        GTEST_SKIP() << skipReason_;
     }
 
     runAsymAllReduce(SizePattern::ExtremeRatio, /*inPlace=*/true, /*registerRecv=*/false,
@@ -1265,10 +1285,10 @@ TEST_F(SymWin_AsymCollective, AllReduce_RepeatedIterations)
 
 class SymWin_AsymLsa : public SymmetricWindowTestBase {};
 
-TEST_F(SymWin_AsymLsa, PeerContent_WithinCommonRange)
+TEST_F(SymWin_AsymLsa, PeerContent_UpToEachPeerSize)
 {
     if (!setupForAsymmetric()) {
-        GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
+        GTEST_SKIP() << skipReason_;
     }
 
     using T = float;
@@ -1286,9 +1306,8 @@ TEST_F(SymWin_AsymLsa, PeerContent_WithinCommonRange)
     ncclWindow_t win = registerWindow(comm, buf, bufSize);
     ASSERT_MPI_NE(win, nullptr);
 
-    const size_t localCount  = bufSize / sizeof(T);
-    const size_t commonElems = commonCount<T>(bufSize);
-    ASSERT_MPI_GT(commonElems, 0u);
+    const size_t localCount = bufSize / sizeof(T);
+    ASSERT_MPI_GT(localCount, 0u);
 
     initSendBuffer<T>(buf, localCount, rank);
 
@@ -1356,7 +1375,7 @@ TEST_F(SymWin_AsymLsa, PeerContent_WithinCommonRange)
 TEST_F(SymWin_AsymLsa, PeerPointerStride_IndependentOfRankSizes)
 {
     if (!setupForAsymmetric()) {
-        GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
+        GTEST_SKIP() << skipReason_;
     }
 
     ncclComm_t comm = getActiveCommunicator();
@@ -1413,7 +1432,7 @@ TEST_F(SymWin_AsymLsa, PeerPointerStride_IndependentOfRankSizes)
 TEST_F(SymWin_AsymLsa, PointerOffsetAtLocalWindowEnd_Rejected)
 {
     if (!setupForAsymmetric()) {
-        GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
+        GTEST_SKIP() << skipReason_;
     }
 
     ncclComm_t comm = getActiveCommunicator();
@@ -1541,7 +1560,7 @@ TEST_F(SymWin_WindowLifecycle, RepeatedRegisterDeregister)
 TEST_F(SymWin_WindowLifecycle, MultipleAsymmetricWindows)
 {
     if (!setupForAsymmetric()) {
-        GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
+        GTEST_SKIP() << skipReason_;
     }
 
     ncclComm_t comm = getActiveCommunicator();
@@ -1581,7 +1600,7 @@ TEST_F(SymWin_WindowLifecycle, MultipleAsymmetricWindows)
 TEST_F(SymWin_WindowLifecycle, RepeatedRegisterDeregister_AsymmetricSizes)
 {
     if (!setupForAsymmetric()) {
-        GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
+        GTEST_SKIP() << skipReason_;
     }
 
     ncclComm_t comm = getActiveCommunicator();
@@ -1597,6 +1616,7 @@ TEST_F(SymWin_WindowLifecycle, RepeatedRegisterDeregister_AsymmetricSizes)
     for (int i = 0; i < iterations; i++) {
         ncclWindow_t win = registerWindow(comm, buf, bufSize);
         ASSERT_MPI_NE(win, nullptr);
+        assertWindowHonoursSize(win, bufSize, rank);
 
         deregisterTrackedWindow(comm, win);
     }
@@ -1608,7 +1628,7 @@ TEST_F(SymWin_WindowLifecycle, RepeatedRegisterDeregister_AsymmetricSizes)
 TEST_F(SymWin_WindowLifecycle, ReregisterWithDifferentAsymmetricPattern)
 {
     if (!setupForAsymmetric()) {
-        GTEST_SKIP() << "Requires symmetric support with 2+ ranks";
+        GTEST_SKIP() << skipReason_;
     }
 
     ncclComm_t comm = getActiveCommunicator();
@@ -1622,11 +1642,13 @@ TEST_F(SymWin_WindowLifecycle, ReregisterWithDifferentAsymmetricPattern)
     const size_t firstSize = asymBytes(SizePattern::Ascending, rank, nRanks);
     ncclWindow_t firstWin = registerWindow(comm, buf, firstSize);
     ASSERT_MPI_NE(firstWin, nullptr);
+    assertWindowHonoursSize(firstWin, firstSize, rank);
     deregisterTrackedWindow(comm, firstWin);
 
     const size_t secondSize = asymBytes(SizePattern::Descending, rank, nRanks);
     ncclWindow_t secondWin = registerWindow(comm, buf, secondSize);
     ASSERT_MPI_NE(secondWin, nullptr);
+    assertWindowHonoursSize(secondWin, secondSize, rank);
     deregisterTrackedWindow(comm, secondWin);
 
     TEST_INFO("Rank %d: re-registered %zu bytes after %zu bytes", rank, secondSize, firstSize);
