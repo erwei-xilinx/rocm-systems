@@ -1649,6 +1649,100 @@ bool mutate_relocation(std::vector<std::uint8_t>& image, std::size_t index, std:
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// hsa_amd_pointer_info on AIE allocations
+// ---------------------------------------------------------------------------
+// A full-ELF design reaches its buffers through addresses written into its control code, and those
+// are device addresses. The runtime resolves the two it writes itself; anything further the
+// control code names -- a control scratchpad, a configuration it switches to -- is patched by the
+// application, which needs to be able to ask what the agent's address for its own buffer is.
+
+TEST_F(DispatchTest, PointerInfoReportsDeviceAddress) {
+  constexpr std::size_t kSize = 4096;
+  void* ptr = nullptr;
+  ASSERT_EQ(hsa_amd_memory_pool_allocate(dev_pool, kSize, 0, &ptr), HSA_STATUS_SUCCESS);
+
+  hsa_amd_pointer_info_t info{};
+  info.size = sizeof(info);
+  EXPECT_EQ(hsa_amd_pointer_info(ptr, &info, nullptr, nullptr, nullptr), HSA_STATUS_SUCCESS);
+
+  EXPECT_EQ(info.type, HSA_EXT_POINTER_TYPE_HSA);
+  EXPECT_EQ(info.hostBaseAddress, ptr);
+  EXPECT_EQ(info.sizeInBytes, kSize);
+  EXPECT_EQ(info.agentOwner.handle, aie_agents.front().handle);
+  // A dev-pool allocation is reachable by the agent, so it has an address, and that address is the
+  // agent's rather than the host's.
+  EXPECT_NE(info.agentBaseAddress, nullptr);
+  EXPECT_NE(info.agentBaseAddress, ptr);
+
+  EXPECT_EQ(hsa_amd_memory_pool_free(ptr), HSA_STATUS_SUCCESS);
+}
+
+TEST_F(DispatchTest, PointerInfoReportsAccessibleAgent) {
+  constexpr std::size_t kSize = 4096;
+  void* ptr = nullptr;
+  ASSERT_EQ(hsa_amd_memory_pool_allocate(dev_pool, kSize, 0, &ptr), HSA_STATUS_SUCCESS);
+
+  hsa_amd_pointer_info_t info{};
+  info.size = sizeof(info);
+  std::uint32_t num_agents = 0;
+  hsa_agent_t* agents = nullptr;
+  EXPECT_EQ(hsa_amd_pointer_info(ptr, &info, std::malloc, &num_agents, &agents),
+            HSA_STATUS_SUCCESS);
+
+  // The allocation came from one agent's pool and has no per-agent imports, so that agent is the
+  // only one that can reach it.
+  ASSERT_EQ(num_agents, 1u);
+  ASSERT_NE(agents, nullptr);
+  EXPECT_EQ(agents[0].handle, aie_agents.front().handle);
+  std::free(agents);
+
+  EXPECT_EQ(hsa_amd_memory_pool_free(ptr), HSA_STATUS_SUCCESS);
+}
+
+TEST_F(DispatchTest, PointerInfoResolvesInteriorPointer) {
+  constexpr std::size_t kSize = 4096;
+  constexpr std::size_t kOffset = 256;
+  void* ptr = nullptr;
+  ASSERT_EQ(hsa_amd_memory_pool_allocate(dev_pool, kSize, 0, &ptr), HSA_STATUS_SUCCESS);
+
+  hsa_amd_pointer_info_t base{};
+  base.size = sizeof(base);
+  hsa_amd_pointer_info_t inside{};
+  inside.size = sizeof(inside);
+  ASSERT_EQ(hsa_amd_pointer_info(ptr, &base, nullptr, nullptr, nullptr), HSA_STATUS_SUCCESS);
+  ASSERT_EQ(hsa_amd_pointer_info(static_cast<std::uint8_t*>(ptr) + kOffset, &inside, nullptr,
+                                 nullptr, nullptr),
+            HSA_STATUS_SUCCESS);
+
+  // An address part-way into an allocation reports that allocation, so a patch site naming a field
+  // inside a buffer gets its device address by adding the same offset to agentBaseAddress.
+  EXPECT_EQ(inside.type, base.type);
+  EXPECT_EQ(inside.hostBaseAddress, base.hostBaseAddress);
+  EXPECT_EQ(inside.agentBaseAddress, base.agentBaseAddress);
+  EXPECT_EQ(inside.sizeInBytes, base.sizeInBytes);
+
+  EXPECT_EQ(hsa_amd_memory_pool_free(ptr), HSA_STATUS_SUCCESS);
+}
+
+TEST_F(DispatchTest, PointerInfoUnknownAfterFree) {
+  constexpr std::size_t kSize = 4096;
+  void* ptr = nullptr;
+  ASSERT_EQ(hsa_amd_memory_pool_allocate(dev_pool, kSize, 0, &ptr), HSA_STATUS_SUCCESS);
+  ASSERT_EQ(hsa_amd_memory_pool_free(ptr), HSA_STATUS_SUCCESS);
+
+  // A released allocation must not keep answering, or a stale pointer would look patchable.
+  hsa_amd_pointer_info_t info{};
+  info.size = sizeof(info);
+  EXPECT_EQ(hsa_amd_pointer_info(ptr, &info, nullptr, nullptr, nullptr), HSA_STATUS_SUCCESS);
+  EXPECT_EQ(info.type, HSA_EXT_POINTER_TYPE_UNKNOWN);
+
+  // An unsized output struct is still rejected on this path, as on every other.
+  hsa_amd_pointer_info_t unsized{};
+  EXPECT_EQ(hsa_amd_pointer_info(ptr, &unsized, nullptr, nullptr, nullptr),
+            HSA_STATUS_ERROR_INVALID_ARGUMENT);
+}
+
 class FullElfDispatchTest : public DispatchTest {
  protected:
   aie_full_elf::Kernel kernel;
