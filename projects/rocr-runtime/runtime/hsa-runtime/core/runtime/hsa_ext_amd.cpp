@@ -54,6 +54,7 @@
 
 #include "core/inc/agent.h"
 #include "core/inc/amd_aie_agent.h"
+#include "core/inc/amd_xdna_driver.h"
 #include "core/inc/amd_aql_queue.h"
 #include "core/inc/amd_cpu_agent.h"
 #include "core/inc/amd_gpu_agent.h"
@@ -2301,6 +2302,26 @@ hsa_status_t hsa_amd_external_semaphore_handle_close(
     if (s != HSA_STATUS_ERROR_INVALID_AGENT) return s;
   }
   return HSA_STATUS_ERROR_INVALID_AGENT;
+  CATCH;
+}
+
+hsa_status_t hsa_amd_aie_agent_device_address(hsa_agent_t agent_handle, void* ptr,
+                                              uint64_t* device_address, size_t* bytes_from_ptr) {
+  TRY;
+  IS_OPEN();
+
+  if (ptr == nullptr || device_address == nullptr) {
+    return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+
+  const core::Agent* agent = core::Agent::Convert(agent_handle);
+  IS_VALID(agent);
+  if (agent->device_type() != core::Agent::kAmdAieDevice) {
+    return HSA_STATUS_ERROR_INVALID_AGENT;
+  }
+
+  return static_cast<const AMD::XdnaDriver&>(agent->driver())
+      .QueryDeviceAddress(*agent, ptr, device_address, bytes_from_ptr);
   CATCH;
 }
 

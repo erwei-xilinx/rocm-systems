@@ -84,9 +84,10 @@
  * - 1.30 - hsa_amd_queue_get_info: engine type and SDMA engine ID
  * - 1.31 - hsa_amd_queue_get_info: queue read/write pointer addresses
  * - 1.32 - hsa_amd_svm_discard_and_prefetch_batch_async
+ * - 1.33 - hsa_amd_aie_agent_device_address
  */
 #define HSA_AMD_INTERFACE_VERSION_MAJOR 1
-#define HSA_AMD_INTERFACE_VERSION_MINOR 32
+#define HSA_AMD_INTERFACE_VERSION_MINOR 33
 
 #ifdef __cplusplus
 extern "C" {
@@ -5192,6 +5193,47 @@ typedef enum hsa_amd_log_flag_s {
  * initialized.
  */
 hsa_status_t hsa_amd_enable_logging(uint8_t* flags, void* file);
+
+/**
+ * @brief Reports the device address an AIE agent sees for a buffer.
+ *
+ * A full-ELF kernel reaches its buffers through addresses written into its control code, and those
+ * are device addresses, not the host virtual addresses the allocation is known by. The runtime
+ * writes two of them itself -- the control code's own and
+ * ::hsa_amd_aie_kernel_dispatch_packet_t::pdi_addr's -- but a design may need more: a control
+ * scratchpad, or a further configuration to switch to. Those belong to the application, which
+ * allocated them and knows from the ELF's relocations where their patch sites are; the device
+ * address is the one part it cannot work out for itself.
+ *
+ * A buffer patched this way is reached only through the address written, so the dispatch must also
+ * keep it resident. Naming it in ::hsa_amd_aie_kernel_dispatch_packet_t::kernarg_address does that;
+ * a size of 0 there keeps it resident without flushing it.
+ *
+ * @param[in] agent AIE agent owning the memory pool @p ptr was allocated from.
+ *
+ * @param[in] ptr Virtual address to resolve. Must lie within an allocation from a memory pool
+ * belonging to @p agent.
+ *
+ * @param[out] device_address Device address of @p ptr, or 0 if the allocation has none -- which
+ * also means the agent cannot fetch from it directly, and patching that address into control code
+ * would hang the dispatch rather than fault it.
+ *
+ * @param[out] bytes_from_ptr Number of bytes between @p ptr and the end of its allocation. May be
+ * NULL.
+ *
+ * @retval ::HSA_STATUS_SUCCESS The device address has been resolved.
+ *
+ * @retval ::HSA_STATUS_ERROR_NOT_INITIALIZED The HSA runtime has not been initialized.
+ *
+ * @retval ::HSA_STATUS_ERROR_INVALID_AGENT @p agent is invalid or is not an AIE agent.
+ *
+ * @retval ::HSA_STATUS_ERROR_INVALID_ARGUMENT @p ptr or @p device_address is NULL.
+ *
+ * @retval ::HSA_STATUS_ERROR_INVALID_ALLOCATION @p ptr does not lie within an allocation belonging
+ * to @p agent.
+ */
+hsa_status_t hsa_amd_aie_agent_device_address(hsa_agent_t agent, void* ptr,
+                                              uint64_t* device_address, size_t* bytes_from_ptr);
 
 /** @} */
 

@@ -179,6 +179,23 @@ public:
 
   hsa_status_t CheckAcceleratorReadiness(core::Agent& agent, bool* ready) const override;
 
+  /// @brief Reports the device address the AIE agent sees for @p ptr.
+  ///
+  /// A full-ELF kernel reaches its buffers through addresses written into its control code, and
+  /// those are device addresses, not the host virtual addresses the allocation is known by. The
+  /// runtime writes two of them itself -- the control code's own and the PDI's -- but a design may
+  /// need more: a control scratchpad, or a further configuration to switch to. Those belong to the
+  /// application, which allocated them and knows from the ELF's relocations where their patch sites
+  /// are; the device address is the one part it cannot work out for itself.
+  ///
+  /// @param[in] agent agent owning the memory pool @p ptr was allocated from
+  /// @param[in] ptr virtual address to resolve
+  /// @param[out] device_address device address of @p ptr, or 0 if the allocation has none, which
+  /// also means the agent cannot fetch from it directly
+  /// @param[out] bytes_from_ptr bytes between @p ptr and the end of its allocation; may be null
+  hsa_status_t QueryDeviceAddress(const core::Agent& agent, void* ptr, uint64_t* device_address,
+                                  size_t* bytes_from_ptr) const;
+
  private:
   /// @brief Queries the driver version and updates internal state.
   hsa_status_t QueryDriverVersion();

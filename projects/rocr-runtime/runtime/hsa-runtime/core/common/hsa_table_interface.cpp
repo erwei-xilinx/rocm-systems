@@ -1354,6 +1354,13 @@ hsa_status_t HSA_API hsa_amd_vmem_retain_alloc_handle(hsa_amd_vmem_alloc_handle_
   return amdExtTable->hsa_amd_vmem_retain_alloc_handle_fn(handle, addr);
 }
 
+hsa_status_t HSA_API hsa_amd_aie_agent_device_address(hsa_agent_t agent, void* ptr,
+                                                      uint64_t* device_address,
+                                                      size_t* bytes_from_ptr) {
+  return amdExtTable->hsa_amd_aie_agent_device_address_fn(agent, ptr, device_address,
+                                                         bytes_from_ptr);
+}
+
 hsa_status_t HSA_API hsa_amd_vmem_export_fabric_handle(hsa_fabric_handle_t *fabric_handle,
                                                        hsa_amd_vmem_alloc_handle_t handle,
                                                        uint64_t flags) {

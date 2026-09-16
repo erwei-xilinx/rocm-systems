@@ -2261,5 +2261,24 @@ hsa_status_t XdnaDriver::CheckAcceleratorReadiness(core::Agent& agent, bool* rea
   return HSA_STATUS_ERROR;
 }
 
+hsa_status_t XdnaDriver::QueryDeviceAddress(const core::Agent& agent, void* ptr,
+                                            uint64_t* device_address,
+                                            size_t* bytes_from_ptr) const {
+  if (ptr == nullptr || device_address == nullptr) {
+    return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+
+  uint32_t bo_handle = AMDXDNA_INVALID_BO_HANDLE;
+  size_t bytes = 0;
+  const hsa_status_t err = ResolveDeviceBuffer(fd_, ptr, agent, &bo_handle, device_address, &bytes);
+  if (err != HSA_STATUS_SUCCESS) {
+    return err;
+  }
+  if (bytes_from_ptr != nullptr) {
+    *bytes_from_ptr = bytes;
+  }
+  return HSA_STATUS_SUCCESS;
+}
+
 }  // namespace AMD
 }  // namespace rocr
