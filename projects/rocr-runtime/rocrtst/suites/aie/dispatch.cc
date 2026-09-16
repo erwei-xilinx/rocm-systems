@@ -1649,6 +1649,88 @@ bool mutate_relocation(std::vector<std::uint8_t>& image, std::size_t index, std:
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// hsa_amd_aie_agent_device_address
+// ---------------------------------------------------------------------------
+// A full-ELF design reaches its buffers through addresses written into its control code, and those
+// are device addresses. The runtime resolves the two it writes itself; anything further the
+// control code names -- a control scratchpad, a configuration it switches to -- is patched by the
+// application, which needs to be able to ask what the agent's address for its own buffer is.
+
+TEST_F(DispatchTest, DeviceAddressResolves) {
+  constexpr std::size_t kSize = 4096;
+  void* ptr = nullptr;
+  ASSERT_EQ(hsa_amd_memory_pool_allocate(dev_pool, kSize, 0, &ptr), HSA_STATUS_SUCCESS);
+
+  std::uint64_t dev_addr = 0;
+  std::size_t bytes = 0;
+  EXPECT_EQ(hsa_amd_aie_agent_device_address(aie_agents.front(), ptr, &dev_addr, &bytes),
+            HSA_STATUS_SUCCESS);
+  // A dev-pool allocation is reachable by the agent, so it has an address, and that address is the
+  // agent's rather than the host's.
+  EXPECT_NE(dev_addr, 0u);
+  EXPECT_NE(dev_addr, reinterpret_cast<std::uint64_t>(ptr));
+  EXPECT_EQ(bytes, kSize);
+
+  // bytes_from_ptr is optional: a caller that only wants the address says so by passing null.
+  std::uint64_t again = 0;
+  EXPECT_EQ(hsa_amd_aie_agent_device_address(aie_agents.front(), ptr, &again, nullptr),
+            HSA_STATUS_SUCCESS);
+  EXPECT_EQ(again, dev_addr);
+
+  EXPECT_EQ(hsa_amd_memory_pool_free(ptr), HSA_STATUS_SUCCESS);
+}
+
+TEST_F(DispatchTest, DeviceAddressFollowsOffset) {
+  constexpr std::size_t kSize = 4096;
+  constexpr std::size_t kOffset = 256;
+  void* ptr = nullptr;
+  ASSERT_EQ(hsa_amd_memory_pool_allocate(dev_pool, kSize, 0, &ptr), HSA_STATUS_SUCCESS);
+
+  std::uint64_t base = 0;
+  std::uint64_t inside = 0;
+  std::size_t bytes_from_base = 0;
+  std::size_t bytes_from_inside = 0;
+  ASSERT_EQ(hsa_amd_aie_agent_device_address(aie_agents.front(), ptr, &base, &bytes_from_base),
+            HSA_STATUS_SUCCESS);
+  ASSERT_EQ(hsa_amd_aie_agent_device_address(aie_agents.front(),
+                                             static_cast<std::uint8_t*>(ptr) + kOffset, &inside,
+                                             &bytes_from_inside),
+            HSA_STATUS_SUCCESS);
+
+  // An address part-way into an allocation resolves part-way into its device mapping. A patch site
+  // naming a field inside a buffer depends on this.
+  EXPECT_EQ(inside, base + kOffset);
+  EXPECT_EQ(bytes_from_base, kSize);
+  EXPECT_EQ(bytes_from_inside, kSize - kOffset);
+
+  EXPECT_EQ(hsa_amd_memory_pool_free(ptr), HSA_STATUS_SUCCESS);
+}
+
+TEST_F(DispatchTest, DeviceAddressRejectsBadArguments) {
+  constexpr std::size_t kSize = 4096;
+  void* ptr = nullptr;
+  ASSERT_EQ(hsa_amd_memory_pool_allocate(dev_pool, kSize, 0, &ptr), HSA_STATUS_SUCCESS);
+  std::uint64_t dev_addr = 0;
+
+  EXPECT_EQ(hsa_amd_aie_agent_device_address(aie_agents.front(), nullptr, &dev_addr, nullptr),
+            HSA_STATUS_ERROR_INVALID_ARGUMENT);
+  EXPECT_EQ(hsa_amd_aie_agent_device_address(aie_agents.front(), ptr, nullptr, nullptr),
+            HSA_STATUS_ERROR_INVALID_ARGUMENT);
+
+  // A CPU agent has no AIE mapping to report. Skipped rather than failed if the system reports no
+  // CPU agent, which no real one does.
+  std::vector<hsa_agent_t> cpu_agents;
+  ASSERT_EQ(hsa_iterate_agents(aie_test::discover_agents<HSA_DEVICE_TYPE_CPU>, &cpu_agents),
+            HSA_STATUS_SUCCESS);
+  if (!cpu_agents.empty()) {
+    EXPECT_EQ(hsa_amd_aie_agent_device_address(cpu_agents.front(), ptr, &dev_addr, nullptr),
+              HSA_STATUS_ERROR_INVALID_AGENT);
+  }
+
+  EXPECT_EQ(hsa_amd_memory_pool_free(ptr), HSA_STATUS_SUCCESS);
+}
+
 class FullElfDispatchTest : public DispatchTest {
  protected:
   aie_full_elf::Kernel kernel;
@@ -2583,16 +2665,14 @@ TEST_F(DispatchTest, PartiallyFailedBatchRetiresCompletedPackets) {
   std::memset(bad_insts, 0xFF, insts_size);
 
   std::uint32_t* input = nullptr;
-  ASSERT_EQ(hsa_amd_memory_pool_allocate(data_pool,
-                                         aie_vector_scalar_kernel::element_bytes *
-                                             total_num_dispatches,
-                                         0, reinterpret_cast<void**>(&input)),
+  ASSERT_EQ(hsa_amd_memory_pool_allocate(
+                data_pool, aie_vector_scalar_kernel::element_bytes * total_num_dispatches, 0,
+                reinterpret_cast<void**>(&input)),
             HSA_STATUS_SUCCESS);
   std::uint32_t* output = nullptr;
-  ASSERT_EQ(hsa_amd_memory_pool_allocate(data_pool,
-                                         aie_vector_scalar_kernel::element_bytes *
-                                             total_num_dispatches,
-                                         0, reinterpret_cast<void**>(&output)),
+  ASSERT_EQ(hsa_amd_memory_pool_allocate(
+                data_pool, aie_vector_scalar_kernel::element_bytes * total_num_dispatches, 0,
+                reinterpret_cast<void**>(&output)),
             HSA_STATUS_SUCCESS);
   uint64_t* kernargs = nullptr;
   ASSERT_EQ(hsa_amd_memory_pool_allocate(
